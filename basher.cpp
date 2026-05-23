@@ -31,8 +31,8 @@ string globalCookie = "";
 string outputFile = "";
 
 void printBar(int current, int total) {
-    int barWidth = 30;
     if (total == 0) return;
+    int barWidth = 30;
     int percent = (current * 100) / total;
     int filled = (current * barWidth) / total;
     
@@ -44,6 +44,7 @@ void printBar(int current, int total) {
     }
     bar += "] " + to_string(percent) + "% | " + to_string(current) + "/" + to_string(total);
     bar += " | Threads: " + to_string(activeThreads);
+    bar += "                    ";
     
     cout << bar << flush;
 }
@@ -127,7 +128,7 @@ void scanWorker(string baseUrl, int threadId) {
                 else if (result.statusCode == 403) msg = "403 Forbidden";
                 
                 foundPaths.push_back("/" + word + " [" + msg + "]");
-                cout << "\r\033[K[+] /" << word << " [" << msg << "]" << endl;
+                cout << "\r[+] /" << word << " [" << msg << "]                    " << endl;
             }
             
             if (attempts % 10 == 0 || attempts == totalWords) {
@@ -194,9 +195,9 @@ void startBruteForce(Args config) {
     running = false;
     this_thread::sleep_for(chrono::milliseconds(200));
     
-    cout << "\r\033[KProgress: [";
+    cout << "\rProgress: [";
     for (int i = 0; i < 30; i++) cout << "=";
-    cout << "] 100% | " << totalWords << "/" << totalWords << endl;
+    cout << "] 100% | " << totalWords << "/" << totalWords << "                    " << endl;
     
     cout << "\n====================================" << endl;
     if (!foundPaths.empty()) {
