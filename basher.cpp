@@ -7,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <queue>
+#include <chrono>
 #include <curl/curl.h>
 
 using namespace std;
@@ -31,6 +32,7 @@ string outputFile = "";
 
 void printBar(int current, int total) {
     int barWidth = 30;
+    if (total == 0) return;
     int percent = (current * 100) / total;
     int filled = (current * barWidth) / total;
     
@@ -190,6 +192,7 @@ void startBruteForce(Args config) {
     }
     
     running = false;
+    this_thread::sleep_for(chrono::milliseconds(200));
     
     cout << "\r\033[KProgress: [";
     for (int i = 0; i < 30; i++) cout << "=";
