@@ -6,50 +6,60 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <queue>
 #include <chrono>
 #include <curl/curl.h>
 
 using namespace std;
 
-mutex queueLock;
-mutex printLock;
-mutex poolLock;
-vector<string> wordQueue;
-vector<string> foundPaths;
-vector<string> extensions;
-queue<CURL*> connectionPool;
-int currentIndex = 0;
-int totalWords = 0;
-int attempts = 0;
-int activeThreads = 0;
-int maxThreads = 10;
-int minThreads = 2;
-int errors429 = 0;
-bool running = true;
-string globalCookie = "";
-string outputFile = "";
+static mutex printLock;
+static mutex poolLock;
+static mutex workLock;
 
-void printBar(int current, int total) {
+struct WorkItem {
+    string word;
+    int retries;
+};
+
+static queue<WorkItem> workQueue;
+static vector<string> foundPaths;
+static queue<CURL*> connectionPool;
+
+static atomic<int> totalWords{0};
+static atomic<int> remaining{0};
+static atomic<int> activeThreads{0};
+static atomic<int> maxThreads{10};
+static atomic<int> minThreads{2};
+static atomic<int> errors429{0};
+static atomic<bool> running{false};
+
+static string globalCookie = "";
+static string outputFile = "";
+static vector<string> extensions;
+
+static void redrawBar(int done, int total) {
     if (total == 0) return;
-    int barWidth = 30;
-    int percent = (current * 100) / total;
-    int filled = (current * barWidth) / total;
-    
-    string bar = "\r[";
+    constexpr int barWidth = 30;
+    int percent = (done * 100) / total;
+    int filled = (done * barWidth) / total;
+    string bar = "[";
     for (int i = 0; i < barWidth; i++) {
         if (i < filled) bar += "=";
         else if (i == filled) bar += ">";
         else bar += " ";
     }
-    bar += "] " + to_string(percent) + "% | " + to_string(current) + "/" + to_string(total);
-    bar += " | Threads: " + to_string(activeThreads);
-    bar += "                    ";
-    
-    cout << bar << flush;
+    bar += "] " + to_string(percent) + "% | " + to_string(done) + "/" + to_string(total);
+    bar += " | Threads: " + to_string(activeThreads.load()) + "                    ";
+    cout << "\033[s\033[9999;0H\r" << bar << "\033[u" << flush;
 }
 
-CURL* getConnection() {
+static void printFound(const string& entry, int done, int total) {
+    cout << "\033[s\033[9999;0H\033[2K\033[u" << entry << "\n" << flush;
+    redrawBar(done, total);
+}
+
+static CURL* getConnection() {
     lock_guard<mutex> lock(poolLock);
     if (!connectionPool.empty()) {
         CURL* conn = connectionPool.front();
@@ -59,174 +69,193 @@ CURL* getConnection() {
     return createConnection(globalCookie);
 }
 
-void returnConnection(CURL* conn) {
+static void returnConnection(CURL* conn) {
+    if (!conn) return;
     lock_guard<mutex> lock(poolLock);
     connectionPool.push(conn);
 }
 
-void adjustThreads() {
-    if (errors429 > 50) {
-        maxThreads = max(minThreads, maxThreads / 2);
-        errors429 = 0;
-    }
-    else if (errors429 == 0 && maxThreads < 50) {
-        maxThreads = min(50, maxThreads + 2);
+static void adjustThreads() {
+    int e = errors429.load();
+    int cur = maxThreads.load();
+    int mn = minThreads.load();
+    if (e > 50) {
+        maxThreads.store(max(mn, cur / 2));
+        errors429.store(0);
+    } else if (e == 0 && cur < 50) {
+        maxThreads.store(min(50, cur + 2));
     }
 }
 
-vector<string> getWords() {
+static vector<string> buildWordList(const vector<string>& base, const vector<string>& exts) {
     vector<string> result;
-    
-    for (string word : wordQueue) {
-        if (!extensions.empty()) {
-            result.push_back(word);
-            for (string ext : extensions) {
-                result.push_back(word + ext);
-            }
-        }
-        else {
-            result.push_back(word);
+    result.reserve(base.size() * max((size_t)1, exts.size() + 1));
+    for (const string& word : base) {
+        result.push_back(word);
+        for (const string& ext : exts) {
+            result.push_back(word + ext);
         }
     }
-    
     return result;
 }
 
-void scanWorker(string baseUrl, int threadId) {
+static void scanWorker(const string& baseUrl, int) {
+    activeThreads.fetch_add(1);
     CURL* curl = getConnection();
-    if (!curl) return;
-    
-    while (running) {
-        string word;
-        
+    if (!curl) {
+        activeThreads.fetch_sub(1);
+        return;
+    }
+
+    while (running.load()) {
+        WorkItem item;
         {
-            lock_guard<mutex> lock(queueLock);
-            if (currentIndex >= totalWords) break;
-            word = wordQueue[currentIndex];
-            currentIndex++;
+            lock_guard<mutex> lock(workLock);
+            if (workQueue.empty()) break;
+            item = workQueue.front();
+            workQueue.pop();
         }
-        
-        string fullUrl = baseUrl + "/" + word;
+
+        string fullUrl = baseUrl + "/" + item.word;
         HttpResponse result = sendGet(curl, fullUrl);
-        
-        {
+
+        if (result.statusCode == 429) {
+            errors429.fetch_add(1);
+            adjustThreads();
+            if (item.retries < 3) {
+                item.retries++;
+                lock_guard<mutex> lock(workLock);
+                workQueue.push(item);
+            } else {
+                int done = totalWords.load() - remaining.fetch_sub(1) + 1;
+                lock_guard<mutex> lock(printLock);
+                redrawBar(done, totalWords.load());
+            }
+            this_thread::sleep_for(chrono::milliseconds(500));
+            continue;
+        }
+
+        int done = totalWords.load() - remaining.fetch_sub(1) + 1;
+
+        if (result.statusCode == 200 || result.statusCode == 301 ||
+            result.statusCode == 302 || result.statusCode == 403) {
+
+            string msg;
+            switch (result.statusCode) {
+                case 200: msg = "200 OK"; break;
+                case 301: msg = "301 Moved"; break;
+                case 302: msg = "302 Redirect"; break;
+                case 403: msg = "403 Forbidden"; break;
+            }
+
+            string entry = "[+] /" + item.word + " [" + msg + "]";
             lock_guard<mutex> lock(printLock);
-            attempts++;
-            
-            if (result.statusCode == 429) {
-                errors429++;
-                adjustThreads();
-            }
-            
-            if (result.statusCode == 200 || result.statusCode == 301 || 
-                result.statusCode == 302 || result.statusCode == 403) {
-                
-                string msg;
-                if (result.statusCode == 200) msg = "200 OK";
-                else if (result.statusCode == 301) msg = "301 Moved";
-                else if (result.statusCode == 302) msg = "302 Redirect";
-                else if (result.statusCode == 403) msg = "403 Forbidden";
-                
-                foundPaths.push_back("/" + word + " [" + msg + "]");
-                cout << "\r[+] /" << word << " [" << msg << "]                    " << endl;
-            }
-            
-            if (attempts % 10 == 0 || attempts == totalWords) {
-                printBar(attempts, totalWords);
-            }
+            foundPaths.push_back("/" + item.word + " [" + msg + "]");
+            printFound(entry, done, totalWords.load());
+        } else {
+            lock_guard<mutex> lock(printLock);
+            redrawBar(done, totalWords.load());
         }
     }
-    
+
     returnConnection(curl);
+    activeThreads.fetch_sub(1);
 }
 
 void startBruteForce(Args config) {
-    cout << "====================================" << endl;
-    cout << "  Basher - Directory Brute Forcer" << endl;
-    cout << "====================================" << endl;
-    cout << "Target : " << config.url << endl;
-    cout << "Threads: " << config.threads << endl;
-    
-    maxThreads = config.threads;
-    minThreads = config.threads / 5;
-    if (minThreads < 1) minThreads = 1;
-    
-    ifstream file(config.wordlist);
-    if (!file.is_open()) {
-        cout << "[-] Error: Cannot open " << config.wordlist << endl;
-        return;
+    cout << "Target : " << config.url << "\n";
+    cout << "Threads: " << config.threads << "\n";
+
+    {
+        lock_guard<mutex> lp(poolLock);
+        while (!connectionPool.empty()) connectionPool.pop();
     }
-    
-    string word;
-    while (getline(file, word)) {
-        if (!word.empty()) wordQueue.push_back(word);
+    {
+        lock_guard<mutex> lw(workLock);
+        while (!workQueue.empty()) workQueue.pop();
     }
-    file.close();
-    
+    foundPaths.clear();
+    errors429.store(0);
+    running.store(true);
+
+    int threads = max(1, config.threads);
+    maxThreads.store(threads);
+    minThreads.store(max(1, threads / 5));
+
     globalCookie = config.cookie;
     outputFile = config.output;
     extensions = config.extensions;
-    
-    wordQueue = getWords();
-    totalWords = wordQueue.size();
-    currentIndex = 0;
-    attempts = 0;
-    errors429 = 0;
-    running = true;
-    
-    cout << "Words  : " << totalWords << endl;
-    cout << "------------------------------------" << endl;
-    
-    for (int i = 0; i < maxThreads * 2; i++) {
-        connectionPool.push(createConnection(globalCookie));
-    }
-    
-    vector<thread> workers;
-    activeThreads = maxThreads;
-    
-    for (int i = 0; i < maxThreads; i++) {
-        workers.push_back(thread(scanWorker, config.url, i));
-    }
-    
-    for (auto& t : workers) {
-        t.join();
-    }
-    
-    running = false;
-    this_thread::sleep_for(chrono::milliseconds(200));
-    
-    cout << "\rProgress: [";
-    for (int i = 0; i < 30; i++) cout << "=";
-    cout << "] 100% | " << totalWords << "/" << totalWords << "                    " << endl;
-    
-    cout << "\n====================================" << endl;
-    if (!foundPaths.empty()) {
-        cout << "Found " << foundPaths.size() << " paths:" << endl;
-        for (string path : foundPaths) {
-            cout << "  " << path << endl;
+
+    {
+        ifstream file(config.wordlist);
+        if (!file.is_open()) {
+            cout << "[-] Error: Cannot open " << config.wordlist << "\n";
+            return;
         }
-    }
-    else {
-        cout << "No paths found." << endl;
-    }
-    cout << "====================================" << endl;
-    
-    if (!outputFile.empty() && !foundPaths.empty()) {
-        ofstream outFile(outputFile);
-        if (outFile.is_open()) {
-            for (string path : foundPaths) {
-                outFile << path << endl;
-            }
-            outFile.close();
-            cout << "\n[+] Results saved to: " << outputFile << endl;
+        string word;
+        vector<string> base;
+        while (getline(file, word)) {
+            if (!word.empty()) base.push_back(word);
         }
-        else {
-            cout << "\n[-] Error: Cannot write to " << outputFile << endl;
+        vector<string> all = buildWordList(base, extensions);
+        totalWords.store((int)all.size());
+        remaining.store((int)all.size());
+        lock_guard<mutex> lw(workLock);
+        for (const string& w : all) workQueue.push({w, 0});
+    }
+
+    cout << "Words  : " << totalWords.load() << "\n";
+    cout << "\n";
+
+    {
+        lock_guard<mutex> lp(poolLock);
+        for (int i = 0; i < threads * 2; i++) {
+            CURL* c = createConnection(globalCookie);
+            if (c) connectionPool.push(c);
         }
     }
 
-    while (!connectionPool.empty()) {
-        destroyConnection(connectionPool.front());
-        connectionPool.pop();
+    vector<thread> workers;
+    workers.reserve(threads);
+    for (int i = 0; i < threads; i++) {
+        workers.emplace_back(scanWorker, config.url, i);
+    }
+    for (auto& t : workers) t.join();
+
+    running.store(false);
+
+    {
+        lock_guard<mutex> lock(printLock);
+        redrawBar(totalWords.load(), totalWords.load());
+        cout << "\n";
+    }
+
+    if (!foundPaths.empty()) {
+        cout << "\nFound " << foundPaths.size() << " paths:\n";
+        for (const string& path : foundPaths) {
+            cout << "  " << path << "\n";
+        }
+    } else {
+        cout << "\nNo paths found.\n";
+    }
+
+    if (!outputFile.empty() && !foundPaths.empty()) {
+        ofstream outFile(outputFile);
+        if (outFile.is_open()) {
+            for (const string& path : foundPaths) {
+                outFile << path << "\n";
+            }
+            cout << "[+] Results saved to: " << outputFile << "\n";
+        } else {
+            cout << "[-] Error: Cannot write to " << outputFile << "\n";
+        }
+    }
+
+    {
+        lock_guard<mutex> lp(poolLock);
+        while (!connectionPool.empty()) {
+            destroyConnection(connectionPool.front());
+            connectionPool.pop();
+        }
     }
 }
